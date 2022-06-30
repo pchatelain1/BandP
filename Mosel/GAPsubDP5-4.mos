@@ -1,0 +1,520 @@
+(!************************************************************************
+   The pricing problem for the B&B algorirthm
+   ======================
+
+   file GAPsubDP3.mos
+   `````````````````
+   DESCRIPTION:  Shortest Path Problem be used with Branch-and-Price
+   FEATURES:     mmjobs, Mosel records.
+
+   FURTHER INFO:
+       author: Paul Chatelain (2020) - paul.chatelain.at.uclouvain.be
+
+       STABLE
+       
+       
+       5-3 / New constraints to avoid same path generation when branching - INTEGER
+       
+       5_3 ???
+*************************************************************************!)
+
+
+
+model GAPsubDP3
+
+    uses "mmxprs", "mmjobs", "mmsystem"
+
+
+    parameters
+        TOL = 0.00001
+        GRID=17
+    end-parameters
+
+    !SOURCE_PATH := "Set1/Size"+GRID+"/rand/"
+    SOURCE_PATH := "Set3/Size"+GRID+"/"
+
+    !writeln("On est dans le pricing problem")
+
+    !Initiolizations of general parameters
+    declarations
+     GS,NbP,NbF,NbN, NbA,NbZ, NL, NC,SN: integer
+    end-declarations
+
+    fopen(SOURCE_PATH+"Params2.dat",F_INPUT)                                            ! Open the file F for reading
+    !writeln("Reading file `","Params2.dat","'...")
+    readln(GS,NbP,NbF,NbN, NbA,NbZ, NL, NC,SN)
+
+
+
+
+    forward procedure solve_SP_DP
+    forward procedure return_resultDP
+    forward procedure process_solutionDP
+    forward procedure new_nodeDP
+    forward procedure get_short_path
+    forward procedure get_ordered_path
+    forward procedure print_status
+    forward procedure clear_node
+
+
+    declarations
+        EVENT_GEN_INI_COLS=2     ! Event codes sent to submodels
+        EVENT_GEN_COLS=3
+        EVENT_STOP_SUBMOD=5
+        EVENT_NEW_NODE=9
+        EVENT_CLEAR_NODE=12
+
+        EVENT_SOLVED=6           ! Event codes sent by submodels
+        EVENT_FAILED=7
+        EVENT_READY=8
+        EVENT_INFEAS=11
+        EVENT_NEW_PATH= 13
+    end-declarations
+
+    send(EVENT_READY,0)        ! Model is ready (= running)
+
+
+
+   declarations
+    Nodes= 1..SN
+    Arcs= 1..NbA
+    Zones= 1..NbZ
+    Flights= 1..NbF
+
+    WeightZone:  array(Zones) of integer
+    Successor:  array(Nodes) of list of integer
+    Predecessor: array(Nodes) of list of integer
+    ImpactMatrix: array(Flights) of array(Arcs) of dynamic array(1..2) of array(1..2) of integer
+    ArrivalNodeList: array(Arcs) of integer
+    ArcCap: array(Arcs) of real
+    ArcWeight: array(Flights) of array(Arcs) of integer
+    ArcsInPath: array(range) of list of integer                       ! Which arc compose a path
+    BigM: integer
+
+    var_arc: array(Arcs) of mpvar                                      ! variable of the Pricing: 1 if arc a is selected, 0 otherwise.
+    var_reduced: array(Flights) of mpvar                                ! value r_l
+    var_min: array(Flights) of mpvar                                   ! binary variable y_l
+
+
+    Dual_sigma: array(Arcs) of real                                     ! Dual values of Cons_ArcCap received from Master.
+    Dual_gamma: real                                                    ! Dual value of Cons_MaxPath received from Master.
+    Dual_lambda: array(Flights) of real                                 ! Dual value of Cons_Flow received from Master.
+    !Dual_psi: array(Arcs) of real                                       ! Dual value  received from Master.
+
+
+    obj_val: real                                                       ! To return to the master. Value of the objective function.
+    min_cap_path: array(1..30) of real                          ! Value received from the DP. Minimal cap of the new path.
+    tot_impact_NP: array(1..30) of array(Flights) of real       ! Value received from the DP. Impact of the path for each flight.
+    new_path_short:array(1..30) of list of integer              ! Value received from the DP. List which contains all the arc in the path
+    Compteur: integer
+    TOT_NEW_PATH: integer
+
+
+    cons_to_fix: array(range) of linctr                                 ! Constraints to force the fixed variable to be equal to zero
+    Arc_Nfixed: integer                                                 ! Nuber of arc fixed to zero
+    maxDepth: integer                                                   ! Maximal number of fixed
+    BESTSOFAR: real
+
+    SPObj: linctr
+
+    OutFlow:  linctr
+    InFlow: linctr
+    FlowConservation: array(Nodes) of linctr
+    Cons9: array(Nodes) of linctr
+    Convex1: array(Flights) of linctr
+    Convex2: array(Flights) of linctr
+    Convex3: array(Flights) of linctr
+    Convex4: array(Flights) of linctr
+
+
+
+
+
+
+  !Data structure to fix variables that is passed from Master problem
+  !*****************************************************************
+
+
+     branchvartype=
+        record                  ! Data structure representing compact formulation variables:
+         f: integer             ! flight
+         k: integer             ! path
+         size: integer          ! size of the path
+         path: list of integer  ! List of arc in the fixed path
+         a: integer             ! First divergent arc
+  end-record
+
+
+  Fixed=
+    record
+        var:    branchvartype
+        to_zero:boolean
+    end-record
+
+    Nfixed: integer
+    fixed_vars: array(1..400) of Fixed
+
+ end-declarations
+
+
+
+ initializations from "bin:shmem:data"
+    Successor
+    Predecessor
+    ArcCap
+    ArrivalNodeList
+    ArcWeight
+ end-initializations
+
+
+ case GRID of
+    9:  BigM:= 6000
+    11: BigM:= 7000
+    13: BigM:= 10000
+    15: BigM:= 13000
+    17: BigM:= 20000
+    19: BigM:= 20000
+    21: BigM:= 15000
+    23: BigM:= 27000
+    31: BigM:= 60000
+ end-case
+
+
+!**************** Process Event Messages from Master ***********************
+ repeat
+   wait
+   ev:= getnextevent
+   event:= getclass(ev)
+
+
+   case event of
+
+    EVENT_GEN_COLS:do
+
+    writeln("In the INTEGER pricing problem, we EVENT_GEN_COLS...")
+      initializations from "bin:shmem:Price"
+        Dual_gamma
+        Dual_lambda
+        Dual_sigma
+      end-initializations
+
+      solve_SP_DP
+
+    end-do
+
+    EVENT_NEW_NODE:
+      new_nodeDP
+
+    EVENT_CLEAR_NODE:
+        clear_node
+
+    EVENT_STOP_SUBMOD:
+      break
+  end-case
+
+ until false
+
+
+!****************************************************
+!******************PROCEDURES************************
+!****************************************************
+
+
+!*****************************************************************
+    procedure solve_SP_DP
+
+
+
+    SPObj:= sum(f in Flights) var_reduced(f)
+
+    OutFlow:= sum(i in Successor(NC)) var_arc(i) = 1                                                                                                                         ! Constraint 1
+    InFlow:= sum(i in Predecessor(SN)) var_arc(i) = 1                                                                                                                        ! Constraint 2
+    forall(n in Nodes | n <> SN  and n <> NC) FlowConservation(n) := sum(i in Predecessor(n)) var_arc(i) = sum(i in Successor(n)) var_arc(i)                                 ! Constraint 3
+    forall(n in Nodes | n <> SN  and n <> NC) Cons9(n) := sum(i in Predecessor(n)) var_arc(i) <= 1
+
+    forall(f in Flights) Convex1(f) := var_reduced(f) <= 0
+
+    forall(f in Flights) Convex2(f) := var_reduced(f) <= (sum(a in Arcs) (ArcWeight(f,a) - Dual_sigma(a))*var_arc(a)) - Dual_lambda(f)
+
+    forall(f in Flights) Convex3(f) := var_reduced(f) >= 0 - BigM*(1-var_min(f))
+
+    forall(f in Flights) Convex4(f) := var_reduced(f)  >= (sum(a in Arcs) (ArcWeight(f,a) - Dual_sigma(a))*var_arc(a)) - Dual_lambda(f) - BigM*var_min(f)
+    forall(i in Arcs) var_arc(i) is_binary
+    forall(f in Flights) var_min(f) is_binary
+    forall(f in Flights) var_reduced(f) is_free
+
+
+    !forall(f in Flights) Convex2(f) := var_reduced(f) <= (sum(a in Arcs, j in 1..getsize(ImpactMatrix(f,a))) (WeightZone(ImpactMatrix(f,a,j,1))*ImpactMatrix(f,a,j,2) - Dual_sigma(a)- Dual_psi(a))*var_arc(a)) - Dual_lambda(f)
+    !forall(f in Flights) Convex4(f) := var_reduced(f)  >= (sum(a in Arcs, j in 1..getsize(ImpactMatrix(f,a))) (WeightZone(ImpactMatrix(f,a,j,1))*ImpactMatrix(f,a,j,2) - Dual_sigma(a)- Dual_psi(a))*var_arc(a)) - Dual_lambda(f) - 999999*var_min(f)
+
+    !writeln("Solving the Pricing Problem....")
+    !file_name := SOURCE_PATH+"Pricing"+Compteur+".txt"
+    !exportprob(EP_MIN, file_name, SPObj)
+
+
+
+    TOT_NEW_PATH := 0
+    BESTSOFAR := 100000000
+    !setparam("XPRS_VERBOSE",true)
+    setcallback(XPRS_CB_INTSOL, "test_sol1")
+    setcallback(XPRS_CB_CM, "test_sol2")
+    minimize(SPObj)
+    Compteur +=1
+    !writeln("Status of the pricing problem: ")
+    print_status
+    writeln("Pricing problem  Objective Value: ", getobjval)
+    writeln("Value of the GAMMA: ", Dual_gamma)
+ 
+
+    return_resultDP
+
+    end-procedure
+!*****************************************************************
+
+!*****************************************************************
+    procedure return_resultDP
+        !Send message to the master problem with status of solution
+        !writeln("Return Result of Pricing Problem")
+
+
+        if getprobstat <> 6  then                                                         ! Si le status du problème est "Solved to optimality" !! Attention changement
+            obj_val := getobjval
+            !writeln("Problem Solved at optimality")
+            if obj_val < Dual_gamma - 0.0001  then
+                writeln("A new path y_j has been found for the flights")
+                send(EVENT_SOLVED, obj_val)
+                process_solutionDP
+            else
+                writeln("The Reduced Cost is not negative, solution cannot be improved")
+                send(EVENT_FAILED, obj_val)
+            end-if
+        else
+            writeln("Pricing problem NOT SOLVED")
+            send(EVENT_FAILED, obj_val)
+        end-if
+
+
+    end-procedure
+!*****************************************************************
+    ! Solution check
+
+ public procedure test_sol1
+ BESTSOFAR:= getsol(SPObj)
+  writeln("New integer sol, Tot: ", getparam("XPRS_MIPSOLS"), ", Value: ", BESTSOFAR, ", Dual_gamma: ", Dual_gamma)
+    if BESTSOFAR < Dual_gamma - 0.01 then
+        TOT_NEW_PATH += 1
+        get_ordered_path
+    end-if
+ end-procedure
+
+ public function test_sol2:boolean
+    if BESTSOFAR < Dual_gamma - 0.01 then
+     if  getparam("XPRS_NODES") > 50  then
+         writeln("On a trouvé", getparam("XPRS_MIPSOLS"), "chemins. Dont ", TOT_NEW_PATH, " sont < gamma...Value: ", getsol(SPObj), ", Dual_gamma: ", Dual_gamma)
+        stopoptimize(XPRS_STOP_USER)
+        returned:= true
+        end-if
+    end-if
+ end-function
+
+
+
+!*****************************************************************
+    procedure process_solutionDP
+
+        !writeln("We launch get ordered path")
+        ! get_ordered_path
+        !writeln("End of get ordered path")
+
+
+         initializations to "mempipe:sol"
+            TOT_NEW_PATH
+            min_cap_path
+            new_path_short
+            tot_impact_NP
+            obj_val
+         end-initializations
+
+    forall(i in 1..TOT_NEW_PATH) do
+    new_path_short(i) := []                                        ! On réinitialise à 0. Super important sinon les chemins sont gardés en mémoire
+    
+    forall(f in Flights) tot_impact_NP(i,f) := 0                  ! For each flight, create the parameter d_{l,k} which is the weight in the OF of RMP
+    end-do
+    obj_val := 0
+    TOT_NEW_PATH := 0
+
+    end-procedure
+!*****************************************************************
+
+
+
+!*****************************************************************
+    procedure get_short_path
+        ! This procedure transform the solution of the shortest path
+        ! Get the new path, the total impact and the minimal cap u_k
+
+        min_cap_path(TOT_NEW_PATH) := 500                                                                                     ! We define an upperbound on arc capacity
+
+
+        forall (a in Arcs) do
+            new_path(a) := getsol(var_arc(a))                                                                  ! Pour chaque arc, 0 ou 1. 1 si l'arc est dans le chemin alors....
+
+            if new_path(a) = 1 then                                                                             ! On copie le numero de l'arc dans un vecteur
+                new_path_short(TOT_NEW_PATH) += [a]
+                    forall(i in Flights) do
+                        forall(j in  1..getsize(ImpactMatrix(i,a))) do                                          ! On calcul l'impact total du nouveau chemin pour chaque avions
+                            tot_impact_NP(TOT_NEW_PATH,i) +=  WeightZone(ImpactMatrix(i,a,j,1))*ImpactMatrix(i,a,j,2)
+                        end-do
+                    end-do
+
+                if ArcCap(a) <= min_cap_path(TOT_NEW_PATH) then                                                               ! On calcule la lowest capacity du chemin
+                    min_cap_path(TOT_NEW_PATH) := ArcCap(a)
+                end-if
+            end-if
+        end-do
+
+    !writeln("Array of arc in the new path: ", new_path_short)
+    !writeln("Total Impact of the new path: ", tot_impact_NP)
+
+
+    end-procedure
+
+
+!***************************************************************
+    procedure get_ordered_path
+
+
+    min_cap_path(TOT_NEW_PATH) := 100                                                                                     ! We define an upperbound on arc capacity
+    CurrentNode := NC
+    (! writeln("Current NODE is: ", CurrentNode)
+
+    write("var_reduced: ")
+    forall(f in Flights) do
+
+      write(getsol(var_reduced(f)),", ")
+    end-do
+    writeln("")
+
+     write("var_reduced: ")
+    forall(f in Flights) do
+
+      write(getsol(var_min(f)),", ")
+    end-do
+    writeln("")  
+
+
+    writeln("Arc:")
+    forall(a in Arcs) do
+     if getsol(var_arc(a)) > 0.0  then
+      write(a, " ")
+      end-if
+    end-do
+    !)
+  
+
+    while(CurrentNode <> SN) do
+
+    !writeln("Current NODE is: ", CurrentNode)
+    !writeln("Successor de current node: ", Successor(CurrentNode))
+
+        forall(a in Successor(CurrentNode)) do
+        !writeln("Le successor de: ", CurrentNode, " est l'arc: ", a)
+            if getsol(var_arc(a)) > 0.0  then
+                !writeln("L'arc ", a , " vaut 1")
+                new_path_short(TOT_NEW_PATH) += [a]
+                 forall(f in Flights) do
+                            tot_impact_NP(TOT_NEW_PATH,f) +=  ArcWeight(f,a)
+                    end-do
+                !writeln("New path en construction: ", new_path_short)
+
+                 if ArcCap(a) <= min_cap_path(TOT_NEW_PATH) then                                                               ! On calcule la lowest capacity du chemin
+                    min_cap_path(TOT_NEW_PATH) := ArcCap(a)
+                end-if
+             CurrentNode := ArrivalNodeList(a)
+             break
+            end-if
+
+                !writeln("Le nouveau current NODE est: ", CurrentNode)
+
+        end-do
+
+    end-do
+
+    writeln("New path, ", TOT_NEW_PATH," is: ", new_path_short(TOT_NEW_PATH), "with Capacity: ", min_cap_path(TOT_NEW_PATH))
+
+    end-procedure
+
+
+!*****************************************************************
+
+
+
+!*****************************************************************
+
+    procedure new_nodeDP
+       writeln("In the INTEGER pricing problem, we EVENT_NEW_NOD")
+       writeln("Variables fixées précédemment: ", Arc_Nfixed)
+
+
+        initializations from "bin:shmem:fixed"
+          Nfixed
+          fixed_vars
+        end-initializations
+
+        if Nfixed > maxDepth then
+        maxDepth := Nfixed
+        end-if
+
+         forall(a in 1..Nfixed) do
+             if fixed_vars(a).to_zero = true then
+                 Arc_Nfixed += 1
+                 cons_to_fix(Arc_Nfixed) := sum(arc in fixed_vars(a).var.path) var_arc(arc) <= fixed_vars(a).var.size - 1
+             end-if
+        end-do
+
+
+    end-procedure
+
+
+!*****************************************************************
+
+procedure clear_node
+    !writeln("Launching clear node procedure...Nfixed is: ", Nfixed)
+    forall(i in 1..Arc_Nfixed) do                                  ! We delete the previous constraint
+        cons_to_fix(i) := 0
+    end-do
+
+    forall(a in 1..maxDepth+1) do
+      fixed_vars(a).var.path := []
+    end-do
+
+
+    Arc_Nfixed := 0
+    Nfixed:=0
+
+end-procedure
+
+
+!*****************************************************************
+
+procedure print_status
+ declarations
+  status: string
+ end-declarations
+
+ case getprobstat of
+  XPRS_OPT: status:="Optimum found"
+  XPRS_UNF: status:="Unfinished"
+  XPRS_INF: status:="Infeasible"
+  XPRS_UNB: status:="Unbounded"
+  XPRS_OTH: status:="Failed"
+  else status:="???"
+ end-case
+
+ writeln("Problem status Pricing: ", status)
+end-procedure
+
+
+
+end-model
+

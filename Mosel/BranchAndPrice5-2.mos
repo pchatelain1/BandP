@@ -1,0 +1,1668 @@
+(!**************************************************************************
+     A Branch & Price algorithm forthe single-source Minimum Cost Multi-Commodity
+   general K-splittable Flow Problem.
+   ======================
+
+   file BranchAndPrice.mos
+   ```````````````
+   TYPE:         Branch-and-Price for @@@@@@@@@
+
+   FEATURES:     "mmxprs", "mmjobs", "mmsystem"
+   DESCRIPTION:  @@@@@@@@  A set of production batches is assigned to machines with the
+                 objective to maximize profit. The model implements a branch-
+                 and-price algorithm that solves a disaggregated formulation of
+                 the GAP where columns represent feasible assignments of batches
+                 to machines. Column generation is applied at every node of the
+                 branch-and-bound tree. Branching is based on fixing compact
+                 formulation variables that represent assignments of production
+                 batches to machines. The branch-and-bound logic is
+                 implemented in Mosel, and the optimizer is used only to solve
+                 the LP relaxation at each node.
+
+   FURTHER INFO:
+       author: Paul Chatelain (2020) - paul.chatelain.at.uclouvain.be / chatelainpaul.at.hotmail.com
+
+
+       STABLE VERSION / 5.2 / pricing 5.3 and pricing (( (5.2) // LR
+***************************************************************************!)
+
+
+model GAPmas
+    uses "mmxprs", "mmjobs", "mmsystem"
+
+
+    parameters
+
+        DO_BRANCHING=true
+        DO_HEURISTIC=false
+        CUTOFF=1000000
+        BRANCH_STRATEGY=1                                                  ! 0 is for variable branching (this is a placeholder for other branching strategies)
+
+        SUBMOD="GAPsubDP5-2.mos"                                            ! This mosel file contains the pricing problem
+        SUBMOD1="GAPsubDP5-3.mos"
+        MESSLEV=4                                                           ! 0: silent, 1-5: progressivly more detailed output
+
+
+
+        DO_MIP= true
+        GRID=15
+        INITIAL_COL= 6
+        MAXPATH = 4
+        SOURCE_PATH = "Set1/Size"+GRID+"/rand/"
+        !SOURCE_PATH = "Set2/Size"+GRID+"/"
+    end-parameters
+
+
+(!**************************************************************************
+    Parameter and data initialiations:
+        GS: Size of the grid
+        NbP: Number of path
+        NbF: Number of flights
+        NbN: Number of Nodes in the grid
+        NbA: Nmber of Arcs in the grid
+        NbZ: Number of Zones in the grid
+        NL: Number of Layer in the grid
+        NC: Node center (starting node) in the grid
+        SN: Sink node in the grid
+
+        Params2.dat is the file that contains all the information
+
+        Some general parameters are initialized in section "parameters"
+
+****************************************************************************!)
+
+
+
+    declarations
+     GS,NbP,NbF,NbN, NbA,NbZ, NL, NC,SN: integer
+    end-declarations
+
+    fopen(SOURCE_PATH+"Params2.dat",F_INPUT)                                            ! Open the file F for reading
+    !fopen(SOURCE_PATH+OUTPUT,F_OUTPUT)
+
+    readln(GS,NbP,NbF,NbN, NbA,NbZ, NL, NC,SN)
+
+    declarations
+        EVENT_GEN_INI_COLS=2        ! Event codes sent to submodels
+        EVENT_GEN_COLS=3
+        EVENT_STOP_SUBMOD=5
+        EVENT_NEW_NODE=9
+        EVENT_CLEAR_NODE=12
+
+        EVENT_SOLVED=6              ! Event codes sent by submodels
+        EVENT_FAILED=7
+        EVENT_READY=8
+        EVENT_INFEAS=11
+    end-declarations
+
+
+    declarations
+    Ini_Paths= 1..INITIAL_COL
+    Paths: range
+    Flights= 1..NbF
+    Nodes= 1..SN
+    Arcs= 1..NbA
+    Zones= 1..NbZ
+
+    ! Data of the problems
+    WeightZone:  array(Zones) of integer
+    ArcCap: array(Arcs) of real
+    Successor:  array(Nodes) of list of integer
+    Predecessor: array(Nodes) of list of integer
+    ImpactMatrix: array(Flights) of array(Arcs) of dynamic array(1..2) of array(1..2) of integer
+    ArrivalNodeList: array(Arcs) of integer
+    ArcWeight: array(Flights) of array(Arcs) of integer
+
+    end-declarations
+
+
+
+    !Loading the data
+
+      initializations from SOURCE_PATH+"ArcCap.dat"         ArcCap as "ArcCap"                  end-initializations
+      initializations from SOURCE_PATH+"Predecessor2.dat"   Predecessor as "Predecessor"        end-initializations
+      initializations from SOURCE_PATH+"Successor2.dat"     Successor as "Successor"            end-initializations
+      initializations from SOURCE_PATH+"ArrivalNode.dat"    ArrivalNodeList as "ArrivalNode"    end-initializations
+      initializations from SOURCE_PATH+"ImpactMat2.dat"     ArcWeight as "ImpactMat2"           end-initializations
+
+
+
+(!*************************************************************************
+
+**********************  Branch-and-Price Declarations  ********************
+
+*************************************************************************!)
+
+    declarations
+      Master_flowPath:  array(Flights, Paths) of mpvar                  ! Variable of the RMP (Restricted Master Problem) (x_l,j) i.e. if weight of each column.
+      Master_pathSelect: array(Paths) of mpvar                          ! Variable of the RMP. =1 of path k is selected, 0 otherwise. (y^j)
+      Master_arcSelect: array(Arcs) of mpvar                            ! Variable of the RMP. We will branch on this variables. It represents the arcs (z_e)
+
+      Master_FlowMin: linctr                                            ! Objective function of the RMP
+      Master_Cons_FlightPath: array(Flights, Paths) of linctr           ! Constraint 0 of the RMP (x_{l,j} <= y_j for all l,j)
+      Master_Cons_ArcCap: array(Arcs) of linctr                         ! Constraint 1 of the RMP
+      Master_MinflowCons: array(Arcs) of linctr                         ! Constraint 2 of the RMP
+      Master_Cons_MaxPath: linctr                                       ! Constraint 3 of the RMP
+      Master_Cons_Flow: array(Flights) of linctr                        ! Constraint 4 of the RMP
+      Master_Cons_FlightPath2: array(Paths) of linctr
+
+      PathsInArc: array(Arcs) of  list of integer                       ! Which path is going through which arc
+      ArcsInPath: array(Paths) of list of integer                       ! Which arc compose a path
+      ImpactPath: array(Flights) of array(Paths) of real                ! The total impact of a path
+      SmallCap: array(Paths) of real                                    ! The minimal cap of the path
+
+
+
+      Dual_sigma: array(Arcs) of real                                   ! Dual values for Master_Cons_ArcCap
+      Dual_gamma: real                                                  ! Dual value for Master_Cons_MaxPath
+      Dual_lambda: array(Flights) of real                               ! Dual value for Master_Cons_Flow
+
+     obj_val: real                                                       ! Value received from the DP. Value of the objective function.
+        min_cap_path: real                                                  ! Value received from the DP. Minimal cap of the new path.
+        tot_impact_NP: array(Flights) of real                               ! Value received from the DP. Impact of the path for each flight.
+        new_path_short: list of integer                                     ! Value received from the DP. List which contains all the arc in the path.
+
+        branchvartype=record                                                ! Data structure representing compact formulation variables:
+            f: integer                                                      ! flight
+            k: integer                                                      ! path
+            size: integer                                                   ! size of the path
+            path: list of integer                                           ! List of arc in the fixed path
+        end-record
+
+        Fixed= record                                                       ! Data structure representing fixed variables:
+            var:    branchvartype                                           ! Variable that is fixed
+            to_zero: boolean                                                ! True if fixed to zero, false if fixed to one
+       end-record
+
+        fixed_vars: array(range) of Fixed                                   ! Array with all fixed variables
+        Nfixed: integer                                                     ! Number of compact formulation variables fixed
+        consfix: array(range) of linctr                                     ! Constraints to fix variables
+
+        Node=record
+            value: real                                                     ! Optimal value of relaxation associated with node
+            left, right, parent : integer                                   ! Pointers to parent and children in node tree
+            feasible_sol: boolean
+            integer_sol: boolean
+            solbasis: basis                                                 ! Basis associated with optimal value of relaxation
+            prev_val, next_val: integer                                     ! Pointers to nodes in linked queue of active nodes (queue is maintained sorted by value)
+            branchvar: branchvartype                                        ! Variable to branch at (variable branching)
+            gen_path: list of integer                                       ! Path numbers generated at this node                                       (=> defined in solve_node)
+            num_fixed: integer                                              ! Number of variable fixed at this node i.e depth                           (=> defined at every new node)
+            fixed: list of integer                                          ! Binaries list in the tree                                                 (=> defined in function fixvar)
+            bestUbound, bestLbound,gap,time: real                           ! Best upper and lower bound so far, and gap                                (=> defined in mai
+        end-record
+
+        nodes:dynamic array(range) of Node                                  ! Array containing all nodes
+        node: integer                                                       ! Current node being solved by column generation
+        head: integer                                                       ! Head of queue of active nodes (0 if queue is empty)
+        tail: integer                                                       ! Tail of queue of active nodes (0 if queue is empty)
+        Select_node:integer                                                 ! Active node selected for branching
+
+        Low_bound: array(range, 1..2) of real                               ! This table contains the lower bound by depth
+        cutoffNodes: array(range) of integer
+        MIP_counter: integer
+
+        active_path: list of integer                                        ! Store the active path at a node
+        non_integer_flight: list of integer
+        non_integer_path: array(Flights) of list of integer
+
+        compt2: array(Flights) of integer
+        compt3: array(Flights) of list of integer
+        compt4: array(Paths) of integer
+        arc_use: array(Arcs) of integer
+        Tot_num: integer
+        possible_sol: boolean
+        int_FO: real
+        counter_HEUR: integer
+        counter_HEUR_S: integer
+
+        opt_Sol_FlowPath: array(Flights, Paths) of real                           ! Current best feasible solutions
+        opt_Sol_PathSelect: array(Flights) of integer
+
+        tot_time_pricing: real
+        tot_time_heuristic_int: real
+        tot_time_MIP: real
+
+        lower_bound: real                                                 ! Lower bound from Lagrangian relaxation calculated at every iteration
+        Best_Value: real                                                  ! Incumbent value
+        masbasis: basis                                                   ! Used to save basis at every column generation iteration
+        Totiter, Niter: integer                                                  ! Count of column generation iterations
+        number_of_path: integer                                           ! Count the total number of path
+        integer_solution: boolean                                         ! True if latest node solution is integer (set by translate_solution)
+    end-declarations
+
+
+(! ***************** Column Generations Procedures  ***********************!)
+
+    forward procedure solve_nodeZero
+    forward procedure solve_master
+    forward procedure process_master_result
+    forward procedure solve_node
+    forward procedure process_sub_result
+
+    forward procedure do_MIP
+
+    forward procedure integer_heurisitc
+    forward procedure do_integer_flow
+    forward procedure check_num_path
+    forward procedure check_possible_sol
+    forward procedure lower_bound_computation
+
+!Branch-and-Price supporting procedures
+    forward procedure find_non_integer
+    forward procedure check_solution
+    forward procedure branching_variable
+    forward procedure variable_branching_reset
+    forward procedure fixvar(var: branchvartype,to_zero:boolean)
+
+    forward procedure branch_strat0
+    forward procedure branch_strat1
+    forward procedure branch_strat2
+    forward procedure branch_strat3
+    forward procedure branch_strat4
+    forward procedure fix_branch(fl: integer, path_s: integer)
+
+!Reporting procedures
+    forward procedure print_master_solution
+    forward procedure write_msg(msglevel:integer, msg:string)
+    forward procedure print_status
+    forward procedure save_best_solution
+    forward procedure save_best_solution2
+    forward procedure report_file
+
+
+(! ************************************************************************
+
+*******           Solve Root Node with initial columns           **********
+
+*************************************************************************!)
+
+
+! Initial Columns are provided and are not generated here. We just copy the data in the arrays
+    declarations
+        Ini_ArcsInPath: array(Ini_Paths) of list of integer
+        Ini_ImpactPath: array(Flights) of array(Ini_Paths) of real
+        Ini_SmallCap: array(Ini_Paths) of real
+    end-declarations
+
+    initializations from SOURCE_PATH+"ImpactPath.dat"   Ini_ImpactPath as "ImpactPath"    end-initializations
+    initializations from SOURCE_PATH+"ArcsInPath.dat"   Ini_ArcsInPath as "ArcsInPath"    end-initializations
+
+! We copy the data of the k initials path into the array of variable length and we create the (Flights*k) corresponding variables.
+    forall(j in Ini_Paths) do
+        ArcsInPath(j) := Ini_ArcsInPath(j)
+        SmallCap(j) :=  NbF*5
+        create(Master_pathSelect(j))
+        forall(i in Flights)  do
+            create(Master_flowPath(i,j))
+            ImpactPath(i,j) := Ini_ImpactPath(i,j)*3
+        end-do
+    end-do
+
+! Now based on ArcsInPath, we build the array PathsInArcs
+    forall(path in Ini_Paths) do
+        forall(el in ArcsInPath(path)) do
+            PathsInArc(el) += [path]
+        end-do
+    end-do
+
+! We round the arc capacity
+    forall(arc in Arcs) do
+        ArcCap(arc) := floor(ArcCap(arc))
+    end-do
+
+     !Make data available for the pricing problem
+    initializations to "bin:shmem:data"
+        ArcWeight
+        Successor
+        Predecessor
+        ArcCap
+        ArrivalNodeList
+    end-initializations
+
+
+
+(! ************************************************************************
+**************           Running the submodels            *****************
+*************************************************************************!)
+
+    declarations
+        submod:  Model                                          !The pricing submodel
+        submod1: Model
+    end-declarations
+
+    res:= compile("g", SUBMOD, "tmp:gapsub.bim")
+
+        load(submod, "tmp:gapsub.bim")
+        run(submod); wait; ev:=getnextevent
+        if ev.class= EVENT_END then
+            writeln("*** Impossible to start all necessary models - aborting ***")
+            exit(1)
+        end-if
+
+    res1:= compile("g", SUBMOD1, "tmp:gapsub1.bim")
+
+        load(submod1, "tmp:gapsub1.bim")
+        run(submod1); wait; ev:=getnextevent
+        if ev.class= EVENT_END then
+            writeln("*** Impossible to start all necessary models - aborting ***")
+            exit(1)
+        end-if
+
+
+(! ************************************************************************
+*******   Define and solve Master Model with initials columns    **********
+*************************************************************************!)
+
+
+
+
+    number_of_path := INITIAL_COL            ! There are #INITIAL_COL initial paths
+    StartTime := gettime
+    Best_Value:=CUTOFF
+
+    Master_FlowMin := sum(f in Flights, k in Paths) ImpactPath(f,k)*Master_flowPath(f, k)                                                                   ! Objective function definition.
+
+    forall(f in Flights, k in Paths) Master_Cons_FlightPath(f,k) :=  Master_flowPath(f,k) - Master_pathSelect(k)    <= 0                                    ! Constraint 0
+    !forall(k in Paths) Master_Cons_FlightPath2(k) :=  sum(f in Flights) Master_flowPath(f,k)     <= Master_pathSelect(k)*SmallCap(k)                        ! Constraint 0
+    forall (a in Arcs) Master_Cons_ArcCap(a) := sum(f in Flights, el in PathsInArc(a)) Master_flowPath(f,el) - ArcCap(a)*Master_arcSelect(a)  <=  0         ! Constraint 1 (44)
+    Master_Cons_MaxPath := sum(k in Paths) Master_pathSelect(k) <= MAXPATH                                                                                  ! Constraint 3 (46)
+    forall(f in Flights) Master_Cons_Flow(f) := sum(k in Paths) Master_flowPath(f,k) = 1                                                                    ! Constraint 4 (47)
+    consfix(1) := 0
+
+    forall(k in Paths) Master_pathSelect(k) is_binary
+    forall(a in Arcs) Master_arcSelect(a)  is_binary
+    forall(f in Flights, k in Paths) Master_flowPath(f,k) is_binary
+
+    write_msg(2, "Solving initial master problem: "+ (gettime-StartTime) + "sec")
+    !exportprob(EP_MIN, "BandPrice0.txt", Master_FlowMin)
+
+    minimize(XPRS_LIN, Master_FlowMin)
+    savebasis(masbasis)
+
+    write_msg(1, "Iter: 0  sol: " + getobjval)
+
+
+    process_master_result
+    print_master_solution
+    solve_nodeZero
+    lower_bound := getobjval
+
+    write_msg(2, "Solving initial relaxation of restricted master problem: "+ (gettime-StartTime) + "sec")
+
+
+    if DO_MIP then
+        MIP_counter += 1
+        do_MIP
+    end-if
+
+    minimize(XPRS_LIN, Master_FlowMin)
+    process_master_result
+    print_master_solution
+
+
+    write_msg(2, "Solving First node "+ (gettime-StartTime) + "sec")
+
+
+
+!***************************************************************************
+!***************************************************************************
+!***********************   Begin Branch-and-Price  *************************
+!***************************************************************************
+!***************************************************************************
+
+
+if DO_BRANCHING then
+
+!***************************************************************************
+!********   Initialize root node in search tree active nodes  **************
+!***************************************************************************
+
+  writeln("")
+  writeln("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
+  write_msg(2, "Start branching: " + (gettime-StartTime) + "sec")
+  node                   := 0
+  NWfix                  := 0
+  Nfixed                 := 0
+  first_branching        := true
+
+  check_solution
+
+
+  check_solution
+
+  if integer_solution then
+    save_best_solution
+    writeln("This is an integer feasible solution.")
+  else
+    writeln("This is not an integer feasible solution.")
+    integer_heurisitc
+
+    branching_variable
+
+  end-if
+
+
+
+ if getprobstat = 3 or getprobstat = 6  then
+    nodes(node).feasible_sol:=false
+    write_msg(1, "Infeasible")
+  elif integer_solution then
+    write_msg(1, "Integer Solution")
+    nodes(node).integer_sol:=true
+  else
+    nodes(node).feasible_sol:=true
+    nodes(node).integer_sol:=false
+    nodes(node).value:=getobjval
+    nodes(node).parent:=-1
+    nodes(node).prev_val:=-1
+    nodes(node).next_val:=-1
+    head:=0
+    tail:=0
+    Select_node:=0
+    nodes(node).left:= -1
+    nodes(node).right:=-1
+
+  end-if
+
+    nodes(node).time := gettime
+    nodes(node).bestUbound := Best_Value
+    nodes(node).bestLbound := lower_bound
+    nodes(node).gap := 100*(Best_Value - lower_bound)/lower_bound
+
+  if nodes(0).feasible_sol and not nodes(0).integer_sol then
+
+    writeln("Begin looping over search tree nodes...")
+    search_done := false
+
+    repeat
+      node += 1                                     ! We create a new node
+      nodes(node).parent:=Select_node               ! The parent node of the new node is Select_node (i.e. the previous node in the queue )
+      nodes(node).left:= -1
+      nodes(node).right:=-1
+
+
+
+
+    !*****************************************************
+    !** Reset the master model for the current node.
+    !*****************************************************
+    (!Master model columns that are fixed to zero for current node
+    are first put in set fixedcolumns. Constraints consfix are
+    used to fix the columns to zero. Also, information about
+    fixed variables is passed to knapsack submodels.
+    Procedures used:
+        variable_branching_reset
+        fixvar(branchvar:branchvartype,to_zero:boolean)
+    Functions used (to manage set fixedcolumns):
+        function encode(m:integer,k:integer):integer
+        function getm(e:integer):integer
+        function getk(e:integer):integer
+    !)
+
+
+
+    forall(c in 1..Nfixed) consfix(c) := 0                                  ! At a new node, we delete all the previous constraints to fix variables.
+    Nfixed:=0
+    tot_branched := 0
+
+
+
+   variable_branching_reset           ! At a new node, we recreate the table of all branch
+
+      initializations to "bin:shmem:fixed"                                  ! We share the information to the pricing problem
+        Nfixed
+        fixed_vars
+      end-initializations
+
+
+
+    !writeln("Nfixed value after Branching Reset: ", Nfixed)
+    nodes(node).num_fixed := Nfixed
+
+
+    forall(c in 1..Nfixed) do                                                                       ! Forall the fixed variables
+        if fixed_vars(c).to_zero = true then
+            consfix(c):= Master_flowPath(fixed_vars(c).var.f,fixed_vars(c).var.k ) = 0              ! We fiwe the variable x_{f,k} to zero
+        else
+            consfix(c):= Master_flowPath(fixed_vars(c).var.f,fixed_vars(c).var.k ) = 1              ! Or to one.
+            tot_branched += 1
+        end-if
+    end-do
+
+      if tot_branched = MAXPATH then
+      writeln("Number of variable fixed to 1 equals MAXPATH")
+      loadprob(Master_FlowMin)                          ! Reload the problem
+      loadbasis(nodes(Select_node).solbasis)            ! Load saved basis
+
+      minimize(XPRS_LIN,Master_FlowMin)
+      print_status
+      check_solution
+      if getprobstat = 3 or getprobstat = 6  then
+        writeln("Impossible to solve after the branching")
+      else
+        if (integer_solution = true) then
+           if getobjval < Best_Value then
+            Best_Value := getobjval
+            save_best_solution
+            end-if
+        else
+            integer_heurisitc
+        end-if
+     end-if
+
+
+    else
+
+    send(submod1, EVENT_NEW_NODE, 0)
+
+
+    !*****************************************************
+    !** Optimize Master (OK)
+    !*****************************************************
+
+     loadprob(Master_FlowMin)                          ! Reload the problem
+      loadbasis(nodes(Select_node).solbasis)            ! Load saved basis
+
+      minimize(XPRS_LIN,Master_FlowMin)
+      print_status
+      check_solution
+        if getprobstat = 3 or getprobstat = 6  then
+        writeln("Impossible to solve after the branching")
+      else
+        if (integer_solution = true) then
+           if getobjval < Best_Value then
+            Best_Value := getobjval
+            save_best_solution
+            end-if
+        else
+            integer_heurisitc
+        end-if
+     end-if
+
+    savebasis(masbasis)
+
+      process_master_result
+      solve_node
+      check_solution
+
+      if not integer_solution then
+       if getprobstat = 3 or getprobstat = 6  then
+        writeln("Impossible to solve after the branching")
+      else
+      integer_heurisitc
+      end-if
+      !writeln("Update search tree based on solution of current node")
+
+     branching_variable
+      end-if
+
+
+
+    !*****************************************************
+    !** Update search tree based on solution of current node
+    !**(Update status of all nodes using new information)
+    !*****************************************************
+
+  if getprobstat = 3 or getprobstat = 6  then
+        nodes(node).feasible_sol:=false
+        write_msg(3, "Infeasible")
+        cutoffNodes(Nfixed) += 1
+    else
+        nodes(node).feasible_sol:=true
+        nodes(node).value:= getobjval
+
+        savebasis(nodes(node).solbasis)
+        lower_bound_computation
+
+        if integer_solution then                                                    ! Si on trouve une solution entière...
+            write_msg(2, "Integer Solution Found")
+            nodes(node).integer_sol:=true
+            if nodes(node).value<Best_Value then                                    ! Et si cette solution est meilleur que la précédente...
+                save_best_solution                                                  ! On sauvegarde la solution
+                Best_Value:=nodes(node).value                                       ! On update la Best-Value
+                write_msg(2, "Improved integer value: " + Best_Value)
+                 if head=-1 or Best_Value - nodes(head).value < 1.0 then
+                    writeln("TERMINE. La lower bound du meilleur noeud suivant est plus grande que la Current Best Value.")
+                    search_done:=true
+                end-if
+            end-if
+
+        else                                                                    ! Current node become active in the three
+                if nodes(node).value <= Best_Value then
+                    position:= head
+                    !Tail
+                    repeat
+                      if position<>-1 and nodes(node).value > nodes(position).value  then
+                        position:=nodes(position).next_val
+                      else
+                        !p1 will precede node and position will follow
+                        !p1 --- node --- position
+                        if position<>-1 then
+                          p1:=nodes(position).prev_val
+                          nodes(position).prev_val:=node
+                        else
+                          p1:=tail
+                          tail:=node
+                          writeln(p1, tail)
+                        end-if
+                        if p1<>-1 then
+                          nodes(p1).next_val:=node
+                        else
+                          head:=node
+                        end-if
+
+                        nodes(node).prev_val:=p1
+                        nodes(node).next_val:=position
+
+                       break
+                      end-if
+                    until false
+                else
+                    write_msg(3,"Cutoff node: " + node)
+                    cutoffNodes(Nfixed) += 1
+                end-if
+            end-if
+        end-if
+    end-if
+
+
+
+
+    nodes(node).time := gettime
+    nodes(node).bestUbound := Best_Value
+    nodes(node).bestLbound := lower_bound
+    nodes(node).gap := 100*(Best_Value - lower_bound)/lower_bound
+
+    if DO_MIP=true then
+        if getsize(nodes(node).gen_path) > 0 then
+        !if nodes(node).gap > 3 or integer_solution=true then
+            !writeln("Gap is bigger than 3% or FO is integer, we do-MIP")
+            MIP_counter += 1
+            do_MIP
+        !end-if
+    end-if
+    end-if
+
+
+      if MESSLEV>3 then
+        writeln("************NODE REPORT*****************")
+        sn:=node
+        writeln("node: ",sn," Value ",nodes(sn).value,",Gap: ", nodes(sn).gap, ", Variable that will be branched ", nodes(sn).branchvar)
+        writeln("Fixed vars: ", nodes(sn).num_fixed, " Best INTEGER: ", Best_Value ," Best Lower Bound: ", lower_bound)
+        writeln("Go to node: ", nodes(sn).fixed)
+        writeln("Path at this node: ", nodes(sn).gen_path)
+        writeln("Prev val: ", nodes(sn).prev_val, "Next val: ", nodes(sn).next_val)
+        sn:=Select_node
+        writeln("parent: ", sn, " Value ", nodes(sn).value, " L ", nodes(sn).left," R ",nodes(sn).right, " Parent: ", nodes(sn).parent)
+        writeln("branching variable (parent): ", nodes(sn).branchvar)
+        writeln("Prev val: ", nodes(sn).prev_val, "Next val: ", nodes(sn).next_val)
+        writeln("time elapsed ", gettime, " total iter: ", Totiter,
+	        " total cols: ", number_of_path)
+        writeln("******************************************")
+         writeln("Select_node:" , Select_node)
+         writeln("Node:" , node)
+        !writeln("Node LIST:" , nodes)
+
+      end-if
+
+    !*****************************************************
+    !** Select next node using Best Bound Rule
+    !*****************************************************
+      if head=- 1 and nodes(node).value < Best_Value then
+        head := node
+        writeln("NEW RULE HERE")
+      end-if
+
+      if head=-1 or Best_Value - nodes(head).value <0.1 then
+        writeln("HEAD")
+        search_done:= true
+      else
+        Select_node:= head
+      end-if
+
+    if gettime-StartTime > 7200 then
+      search_done:= true
+      end-if
+
+
+    until search_done                           ! repeat until search is done
+
+    end-if
+ end-if                                         ! DO_BRANCHING
+
+
+
+   send(submod1, EVENT_STOP_SUBMOD,0)  ! Stop all models
+
+  !Catch event indicating that all submodels stopped.
+    wait;   dropnextevent;
+
+    writeln("")
+    writeln("********** COMPLETION 100% **********" )
+
+    writeln("***    ROUND REPORT   ***")
+    write_msg(1, "Total time: " + (gettime-StartTime) + "sec")
+    writeln("Total time on pricing: ", tot_time_pricing)
+    writeln("Total heurisitc: ", counter_HEUR_S, "/", counter_HEUR)
+    writeln("Total time on MIP: ", tot_time_MIP , " sec")
+    writeln("Total MIP done:", MIP_counter)
+    write_msg(1, "Optimal objective value: " + Best_Value)
+
+
+   writeln(opt_Sol_FlowPath)
+   writeln(opt_Sol_PathSelect)
+   forall(i in Flights) do
+     writeln(ArcsInPath(opt_Sol_PathSelect(i)))
+   end-do
+
+    writeln("Generated Paths")
+    forall(k in Paths) do
+        write("Path ",k,",")
+        forall(a in 1..getsize(ArcsInPath(k))) do
+            write(ArcsInPath(k,a),",")
+        end-do
+        writeln("] Cap:", SmallCap(k))
+    end-do
+
+    report_file
+
+     !fclose(F_OUTPUT)
+
+
+(! ************************************************************************
+***************************************************************************
+**************************     PROCEDURES     *****************************
+***************************************************************************
+*************************************************************************!)
+
+
+
+!**************************************************************************
+procedure do_MIP
+
+writeln("On essaie de résoudre le MIP....")
+    temp := gettime
+    minimize(Master_FlowMin)
+    tot_time_MIP += (gettime - temp)
+    print_status
+    if getprobstat = 3 or getprobstat = 6  then
+        writeln("Impossible to solve (procedure do_MIP)")
+      else
+     if getobjval < Best_Value then
+      Best_Value := getobjval
+      save_best_solution
+     end-if
+     end-if
+
+end-procedure
+!**************************************************************************
+
+!**************************************************************************
+procedure process_master_result
+ ! Update dual pricing data for subproblems
+
+    savebasis(masbasis)
+    forall(a in Arcs) do
+        Dual_sigma(a) := getdual(Master_Cons_ArcCap(a))
+    end-do
+
+    forall(f in Flights) do
+        Dual_lambda(f) := getdual(Master_Cons_Flow(f))
+    end-do
+
+    Dual_gamma := getdual(Master_Cons_MaxPath)
+
+  initializations to "bin:shmem:Price"
+    Dual_gamma
+    Dual_lambda
+    Dual_sigma
+  end-initializations
+
+end-procedure         !OK
+!**************************************************************************
+
+procedure solve_nodeZero
+    (!  At each iteration, a shortest-path submodel is solved for each
+        flight. Shortest-path solutions produce columns for the master
+        problem and they are also used to calculate a Lagrangean
+        upper bound. The loop is broken when no knapsack solution
+        produces a column that improves the objective function
+        (solved to optimality), when the master value is close
+        enough to the upper bound (solved to almost optimality),
+        or when the upper bound is smaller than the cutoff value
+        (Best bound implies cutoff).
+
+        Uses procedures:
+            process_sub_result
+            solve_master
+            process_master_result
+    !)
+
+  writeln("Solve_node 0")
+
+  Best_low_bound := 0
+  Niter := 0
+
+
+  repeat
+    Niter+=1
+    temp := gettime
+
+    send(submod, EVENT_GEN_COLS, 0)                                ! Start solving all submodels
+    improve:= 0
+    wait
+    ev:=getnextevent                                                ! Get the status of the pricing (SOLVED/FAILED/...)
+
+
+
+    if getclass(ev)=EVENT_INFEAS then
+        write_msg(3, "Infeasible shortest path")
+    end-if
+    if getclass(ev)=EVENT_SOLVED then                               !
+        improve+=1
+        process_sub_result
+        nodes(node).gen_path += [number_of_path]
+    end-if
+
+    if improve = 0  then
+        write_msg(3, "Linear Part solved to optimality")
+
+        break
+    end-if
+    tot_time_pricing += (gettime - temp)
+
+        solve_master
+        process_master_result
+
+    until false
+
+    writeln("Avant le stop")
+    send(submod, EVENT_STOP_SUBMOD,0)
+    wait; dropnextevent;
+    writeln("APRES le stop")
+        solve_master
+        process_master_result
+
+      repeat
+      writeln("LA BOUCLE")
+        Niter+=1
+
+        temp := gettime
+        send(submod1, EVENT_GEN_COLS, 0)                                 ! Start solving the pricing problem
+        improve:= 0
+        wait
+        ev:=getnextevent                                                ! Get the status of the pricing (SOLVED/FAILED/...)
+        tot_time_pricing += (gettime - temp)
+        writeln(getclass(ev))
+
+        if getclass(ev)=EVENT_INFEAS then
+        write_msg(3, "Infeasible shortest path")
+        end-if
+        if getclass(ev)=EVENT_SOLVED then                               !
+            improve+=1
+            process_sub_result
+            nodes(node).gen_path += [number_of_path]
+        end-if
+
+        if improve = 0  then
+            write_msg(3, "Node solved to optimality ici")
+
+            break
+        end-if
+
+
+        solve_master
+        process_master_result
+
+    until false
+
+    send(submod1, EVENT_CLEAR_NODE, 0)
+
+
+
+ Totiter+=Niter
+
+end-procedure
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+procedure solve_node
+    (!  At each iteration, a shortest-path submodel is solved for each
+        flight. Shortest-path solutions produce columns for the master
+        problem and they are also used to calculate a Lagrangean
+        upper bound. The loop is broken when no knapsack solution
+        produces a column that improves the objective function
+        (solved to optimality), when the master value is close
+        enough to the upper bound (solved to almost optimality),
+        or when the upper bound is smaller than the cutoff value
+        (Best bound implies cutoff).
+
+        Uses procedures:
+            process_sub_result
+            solve_master
+            process_master_result
+    !)
+
+  writeln("Solve_node...")
+
+  Best_low_bound := 0
+  Niter := 0
+
+      repeat
+        Niter+=1
+
+        temp := gettime
+        send(submod1, EVENT_GEN_COLS, 0)                                 ! Start solving the pricing problem
+        improve:= 0
+        wait
+        ev:=getnextevent                                                ! Get the status of the pricing (SOLVED/FAILED/...)
+
+        tot_time_pricing += (gettime - temp)
+
+        if getclass(ev)=EVENT_INFEAS then
+        write_msg(3, "Infeasible shortest path")
+        end-if
+        if getclass(ev)=EVENT_SOLVED then                               !
+            improve+=1
+            process_sub_result
+            nodes(node).gen_path += [number_of_path]
+        end-if
+
+        if improve = 0  then
+            write_msg(3, "Node solved to optimality")
+
+            break
+        end-if
+
+        solve_master
+        process_master_result
+
+    until false
+
+    send(submod1, EVENT_CLEAR_NODE, 0)
+    Totiter+=Niter
+end-procedure
+
+
+!**************************************************************************
+procedure process_sub_result
+    ! Add the the new column to the master problem
+    !writeln("Process_sub_result")
+    new_path_short := []
+
+    initializations from "mempipe:noindex,sol"
+        tot_impact_NP
+        min_cap_path
+        new_path_short
+        obj_val
+    end-initializations
+
+
+    number_of_path += 1
+   ! writeln("")
+    writeln("NUMBER OF PATH: ", number_of_path, " et le path est: ", new_path_short)
+    ArcsInPath(number_of_path) += new_path_short                                                    ! We store the information of which arc compose a path
+    SmallCap(number_of_path) := min_cap_path
+
+    forall(el in new_path_short) do                                                                 ! For each arc in the new path
+        PathsInArc(el) += [number_of_path]                                                          ! We select this arc in ArcInPath, we get the size of this array (i.e. the number of path passing through this arc
+    end-do                                                                                          ! We go one cell further (+1) and we add the new path (number of path)
+
+
+
+
+    create(Master_pathSelect(number_of_path))                                                       ! Create the new variable y_j
+    !writeln("On ajoute une variable y et les variables x correspondantes...")
+    Master_pathSelect(number_of_path) is_binary
+    Master_Cons_MaxPath += Master_pathSelect(number_of_path)
+
+
+
+
+
+    forall (f in Flights) do
+        ImpactPath(f, number_of_path) := tot_impact_NP(f)
+
+        create(Master_flowPath(f, number_of_path))                                                          ! We create the new variables.
+        Master_flowPath(f, number_of_path) is_binary
+
+        Master_FlowMin += ImpactPath(f, number_of_path)*Master_flowPath(f,number_of_path)                   ! We add the new variables with their coefficient in the objective function.
+
+        forall(a in new_path_short) Master_Cons_ArcCap(a) += Master_flowPath(f,number_of_path)              ! Pour chaque arc
+
+        Master_Cons_FlightPath(f, number_of_path) := Master_flowPath(f,number_of_path) - Master_pathSelect(number_of_path) <= 0
+        Master_Cons_Flow(f) += Master_flowPath(f,number_of_path)
+    end-do
+
+
+
+
+
+end-procedure
+!**************************************************************************
+
+!**************************************************************************
+procedure solve_master
+    ! Optimize master problem, check the integrality of the solution.
+
+
+    loadprob(Master_FlowMin)
+    loadbasis(masbasis)
+
+    !file_name := SOURCE_PATH+"BandPrice"+Totiter+Niter+".txt"
+    !exportprob(EP_MIN, file_name, Master_FlowMin)
+
+    minimize(XPRS_LIN,Master_FlowMin)
+
+    check_solution
+      if getprobstat = 3 or getprobstat = 6  then
+        writeln("Probem is infeasible (procedure solve_master)")
+      else
+    if (integer_solution = true) then
+        if getobjval < Best_Value then
+        Best_Value := getobjval
+        end-if
+    else
+        integer_heurisitc
+    end-if
+    end-if
+
+   !print_master_solution
+
+end-procedure
+!**************************************************************************
+
+!**************************************************************************
+procedure check_solution
+    (!  Check whether current solution is integer (integer_solution) and if we use at most H path.
+        It this is the case, then the solution is a feasible solution
+        We also store which path is active.
+    !)
+    integer_solution:=true
+
+    if  getobjval - floor(getobjval) = 0 then                        ! If the objective value is integer, we verify if the optimal solution is integer.
+        find_non_integer
+    else
+        integer_solution := false                                       ! If the objective value is not integer, then the solution is not integer
+    end-if
+
+end-procedure
+!**************************************************************************
+
+!**************************************************************************
+procedure find_non_integer
+    non_integer_flight := []
+    forall(f in Flights) do
+    non_integer_path(f) := []
+    end-do
+    active_path := []
+
+    forall(f in Flights) do
+        forall(k in Paths) do
+            if (getsol(Master_flowPath(f,k)) > 0) then
+             active_path += [k]
+
+                if (getsol(Master_flowPath(f,k)) < 1)then
+                    integer_solution:= false
+                    non_integer_flight += [f]
+                    non_integer_path(f) += [k]
+                end-if
+            end-if
+        end-do
+    end-do
+end-procedure
+!**************************************************************************
+
+!**************************************************************************
+procedure branching_variable
+
+    !writeln("Branching variable here")
+
+    case BRANCH_STRATEGY of
+        0: branch_strat0        ! First non-integer variable
+        1: branch_strat1        ! Highest non-integer variable
+        2: branch_strat2        ! Lowest non-integer variable
+        3: branch_strat3        ! Most used paths (only fractional value) and most used variable  on this path
+        4: branch_strat4        ! Least used path (only fractional value) and least used variable on this path
+    end-case
+
+end-procedure
+!**************************************************************************
+!**************************************************************************
+procedure branch_strat0
+    fl := 0
+    path_s := 0
+    forall(f in Flights, k in Paths ) do
+        if (getsol(Master_flowPath(f,k)) > 0 and getsol(Master_flowPath(f,k)) < 1) then
+            fl := f
+            path_s := k
+            break
+        end-if
+    end-do
+    fix_branch(fl, path_s)
+end-procedure
+!**************************************************************************
+procedure branch_strat1
+    maxsol := 0.0
+    fl := 0
+    path_s := 0
+    forall(f in Flights, k in Paths ) do
+        if (getsol(Master_flowPath(f,k)) > 0 and getsol(Master_flowPath(f,k)) < 1 and getsol(Master_flowPath(f,k)) > maxsol) then
+            maxsol := getsol(Master_flowPath(f,k))
+            fl := f
+            path_s := k
+        end-if
+    end-do
+        fix_branch(fl, path_s)
+end-procedure
+!**************************************************************************
+procedure branch_strat2
+    maxsol := 1.0
+    fl := 0
+    path_s := 0
+    forall(f in Flights, k in Paths ) do
+        if (getsol(Master_flowPath(f,k)) > 0  and getsol(Master_flowPath(f,k)) < maxsol) then
+            maxsol := getsol(Master_flowPath(f,k))
+            fl := f
+            path_s := k
+        end-if
+    end-do
+        fix_branch(fl, path_s)
+end-procedure
+!**************************************************************************
+procedure branch_strat3
+    (!
+    We look for the most used paths (we count only the fractional value.
+    Then we look for the highest value of variable on this path
+    !)
+    maxsol := 0.0
+    maxbypath := 0.0
+    fl := 0
+    path_s := 0
+    forall(k in Paths)do
+        forall(f in Flights) do
+            if (getsol(Master_flowPath(f,k)) > 0 and getsol(Master_flowPath(f,k)) < 1) then
+                maxbypath += getsol(Master_flowPath(f,k))
+            end-if
+        end-do
+        if maxbypath > maxsol then
+            maxbypath := maxsol
+            path_s := k
+        end-if
+        maxbypath := 0.0
+    end-do
+
+    maxsol := 0.0
+    forall(f in Flights) do
+     if (getsol(Master_flowPath(f,path_s)) > 0 and getsol(Master_flowPath(f,path_s)) < 1 and getsol(Master_flowPath(f,path_s)) > maxsol) then
+            maxsol := getsol(Master_flowPath(f,path_s))
+            fl := f
+        end-if
+    end-do
+
+        fix_branch(fl, path_s)
+end-procedure
+!**************************************************************************
+procedure branch_strat4
+    (!
+    We look for the most least paths (we count only the fractional value.
+    Then we look for the hlowest value of variable on this path
+    !)
+    maxsol := 11.0
+    maxbypath := 0.0
+    fl := 0
+    path_s := 0
+    forall(k in Paths)do
+        forall(f in Flights) do
+            if (getsol(Master_flowPath(f,k)) > 0 and getsol(Master_flowPath(f,k)) < 1 ) then
+                maxbypath += getsol(Master_flowPath(f,k))
+            end-if
+        end-do
+        if maxbypath > 0 and maxbypath < maxsol then
+            maxbypath := maxsol
+            path_s := k
+        end-if
+        maxbypath := 0.0
+    end-do
+
+    maxsol := 1.0
+    forall(f in Flights) do
+     if (getsol(Master_flowPath(f,path_s)) > 0  and getsol(Master_flowPath(f,path_s)) < maxsol) then
+            maxsol := getsol(Master_flowPath(f,path_s))
+            fl := f
+        end-if
+    end-do
+
+    fix_branch(fl, path_s)
+end-procedure
+!**************************************************************************
+!**************************************************************************
+procedure fix_branch(fl: integer, path_s: integer)
+    nodes(node).branchvar.f := fl
+    nodes(node).branchvar.k:= path_s
+    nodes(node).branchvar.size := getsize(ArcsInPath(nodes(node).branchvar.k))
+    nodes(node).branchvar.path := ArcsInPath(nodes(node).branchvar.k)
+    !writeln("Branched Variable x f: ", nodes(node).branchvar.f, " path: ", nodes(node).branchvar.k)
+end-procedure
+
+
+!**************************************************************************
+!**************************************************************************
+procedure variable_branching_reset
+ (! Determine all compact formulation variables that need to be fixed
+    at the current node. Right children are fixed to zero and left
+    children are fixed to one.
+     uses procedure:
+     fixvar
+ !)
+
+
+  branchvar:= nodes(Select_node).branchvar                          ! Select_node est le noeud ACTIF
+  !writeln(branchvar)
+
+ !Fix variables
+  if nodes(Select_node).left=-1 then           !Left node           ! Si le left node n'a pas encore été attribué (-1) alors:
+    fixvar(branchvar,false)                                          ! On utilise la function fixvar pour fixer la variable qui doit être fixée pour ce noeud (branchvar) qui a été décidé dans la fonction "branching_variable)
+    nodes(Select_node).left:=node                                   ! Si le left n'a pas été attribué, c'est qu'on vient de créer un nouveau noeud et donc le Parent node est ainsi le noeud actif,
+                                                                    ! c'est à dire "Select_node" et on fixe le left node du parent comme étant le nouveau noeud "node".
+
+  else                                         !Right node          ! Si le left node a été déjà été créé, alors on créer le right node, sur le noeud actif
+    fixvar(branchvar,true)
+    nodes(Select_node).right:=node                                  ! Idem
+    !!and take selected node out of queue                           ! Si on a relié le noeud actif à son left ET à son right, le noeud actif, est "résolu" et sort de la liste de noeud que l'on peut sélectionner.
+    head:=nodes(Select_node).next_val                               ! La prochaine valeur dans la liste des noeuds actif et la "next_val" de select node
+    nodes(head).prev_val:=-1                                        ! On ne peut plus atteindre "select_node"
+  end-if
+
+!Fix variable for all the parent nodes in the tree.
+  visit:=Select_node
+  while (nodes(visit).parent<>-1) do
+    parent:=nodes(visit).parent
+    branchvar:=nodes(parent).branchvar
+    if visit=nodes(parent).left then
+      fixvar(branchvar,false)
+    else
+      fixvar(branchvar,true)
+
+    end-if
+    visit:=parent
+  end-do
+
+end-procedure
+!**************************************************************************
+
+!**************************************************************************
+procedure fixvar(branchvar: branchvartype, to_zero: boolean)
+ (!
+ !)
+
+    Nfixed+=1
+    fixed_vars(Nfixed).var:=branchvar
+
+    case to_zero of
+        true: do                                    !Fix to zero
+            fixed_vars(Nfixed).to_zero:=true
+            nodes(node).fixed += [0]
+            end-do
+        false: do                                   !Fix to one
+            fixed_vars(Nfixed).to_zero:=false
+            nodes(node).fixed += [1]
+            end-do
+        end-case
+
+end-procedure  ! OK
+!**************************************************************************
+
+!**************************************************************************
+procedure save_best_solution
+    ! Save the best optimal solution found so far by the algorithm
+
+    forall(f in Flights) do
+        opt_Sol_PathSelect(f) := 0
+        forall(k in Paths) do
+            opt_Sol_FlowPath(f,k) := 0
+            opt_Sol_FlowPath(f,k) := getsol(Master_flowPath(f,k))
+            if getsol(Master_flowPath(f,k)) = 1 then
+                opt_Sol_PathSelect(f) := k
+            end-if
+        end-do
+    end-do
+
+end-procedure   ! OK
+!**************************************************************************
+
+!**************************************************************************
+procedure save_best_solution2
+    ! This procedure save the best optimal solution found so far when this
+    ! solution is found by the heuristic
+
+   forall(f in Flights) do
+        opt_Sol_PathSelect(f) := 0
+        opt_Sol_PathSelect(f) := compt3(f,1)
+        forall(k in Paths) do
+          opt_Sol_FlowPath(f,k) := 0
+        end-do
+        opt_Sol_FlowPath(f,compt3(f,1)) += 1
+    end-do
+
+end-procedure   !OK
+!**************************************************************************
+
+!**************************************************************************
+procedure print_status
+        ! Print the status of the current problem
+ declarations
+  status: string
+ end-declarations
+
+ case getprobstat of
+  XPRS_OPT: status:="Optimum found"
+  XPRS_UNF: status:="Unfinished"
+  XPRS_INF: status:="Infeasible"
+  XPRS_UNB: status:="Unbounded"
+  XPRS_OTH: status:="Failed"
+  else status:="???"
+ end-case
+
+ writeln("Problem status: ", status)
+end-procedure         !OK
+!**************************************************************************
+
+!**************************************************************************
+procedure print_master_solution
+
+    writeln("  ***   **  *** SOLUTION ***  **   *** ")
+    writeln("Current best integer solution: ", Best_Value)
+    writeln("Objective value: ", getobjval)
+
+
+    write("Variable y: ")
+    forall(k in Paths) do
+       write( getsol(Master_pathSelect(k)), ", ")
+    end-do
+
+    writeln(" ")
+     write("Variable x: ")
+    forall(l in Flights) do
+        forall(k in Paths) do
+            write( getsol(Master_flowPath(l,k)), ", ")
+        end-do
+    end-do
+
+    writeln(" ")
+     forall(f in Flights) do
+        write("L'avion ",f, " prend le(s) chemin(s):[ ")
+        forall(k in Paths) do
+          if  getsol(Master_flowPath(f,k)) > 0 then
+          write(k, " (", getsol(Master_flowPath(f,k)), ") " )
+          end-if
+        end-do
+        writeln("]")
+    end-do
+
+    writeln(" ")
+    write("Liste des arcs positifs: ")
+    forall (a in Arcs) do
+      if getsol(Master_arcSelect(a)) > 0 then
+       write(" ", a, " (", getsol(Master_arcSelect(a)), ") ")
+       end-if
+    end-do
+    writeln("")
+    writeln("  ***     *** ****** ***     *** ")
+
+end-procedure   ! ok
+!**************************************************************************
+
+!**************************************************************************
+procedure integer_heurisitc
+ ! This procedure seeks to get an integer solution from a non integer solution
+    counter_HEUR += 1
+    forall (f in Flights) do
+        compt2(f) := 0
+        compt3(f) := []
+    end-do
+
+     forall(f in Flights) do
+        forall(k in Paths) do
+            if  getsol(Master_flowPath(f,k)) > 0 then
+                compt2(f) += 1
+                compt3(f) += [k]
+            end-if
+        end-do
+    end-do
+
+
+    do_integer_flow
+    check_num_path
+
+    if Tot_num <= MAXPATH then
+        check_possible_sol
+        if possible_sol = true then
+            !writeln("Une solution entière a été trouvée...")
+            !writeln("FO integer value: ", int_FO)
+            if int_FO < Best_Value then
+                Best_Value:= int_FO
+                !writeln("Et celle-ci est meilleur que l'actuelle... On update Best_Value")
+                !writeln(compt3)
+                save_best_solution2
+                counter_HEUR_S += 1
+            end-if
+        else
+       writeln("... pas de solution entière réalisable à cause des capacités")
+        end-if
+    else
+        writeln("... pas de solution entière, il y a trop de chemins utilisés")
+    end-if
+        writeln("")
+
+end-procedure
+!**************************************************************************
+
+!**************************************************************************
+procedure do_integer_flow
+
+    most_used := 0
+    most_used_value := 1.0
+
+    forall(f in Flights) do
+        most_used := 0
+        most_used_value := 1.0
+        if compt2(f) > 1 then
+            forall(i in compt3(f)) do
+                if (getsol(Master_flowPath(f,i)) < most_used_value) then
+                    most_used := i
+                    most_used_value := getsol(Master_flowPath(f,i))
+                end-if
+            end-do
+            compt3(f) := [most_used]
+        end-if
+    end-do
+
+end-procedure
+!**************************************************************************
+
+!**************************************************************************
+procedure check_num_path
+
+Tot_num := 0
+forall(i in Paths) do
+  compt4(i) := 0
+end-do
+
+
+forall(i in 1..getsize(compt3)) do
+  compt4(compt3(i,1)) += 1
+end-do
+
+forall(i in Paths) do
+  if compt4(i) > 0 then
+    Tot_num += 1
+  end-if
+end-do
+
+!writeln("Il y a ", Tot_num, " chemins entiers")
+
+end-procedure
+!**************************************************************************
+
+!**************************************************************************
+procedure check_possible_sol
+
+    int_FO := 0.0
+    possible_sol := true
+    forall(arc in Arcs) do
+        arc_use(arc) := 0
+    end-do
+
+    forall(i in 1..getsize(compt3)) do
+        forall(arc in ArcsInPath(compt3(i,1))) do
+            arc_use(arc) += 1
+            int_FO += ArcWeight(i,arc)
+        end-do
+    end-do
+
+    forall(arc in Arcs) do
+        if arc_use(arc) > ArcCap(arc) then
+            possible_sol := false
+        end-if
+    end-do
+
+end-procedure
+!**************************************************************************
+
+!**************************************************************************
+procedure lower_bound_computation
+
+    activeNodes := 0.0
+
+    Low_bound(Nfixed,1) += 1
+    if Low_bound(Nfixed,1) = 1 then
+        Low_bound(Nfixed,2) := 10000000000
+    end-if
+    if Low_bound(Nfixed,2) > nodes(node).value then
+        Low_bound(Nfixed,2) := nodes(node).value
+    end-if
+
+
+    activeNodes := 2^Nfixed
+    !writeln("ACTIVE NODES: ", activeNodes)
+    !writeln("CUTOFF: ", cutoffNodes)
+    forall(i in 1..getsize(cutoffNodes)) do
+       if Nfixed > i then
+       activeNodes -= 2^(Nfixed-i)*cutoffNodes(i)
+       end-if
+    end-do
+       ! writeln("ACTIVE NODES: ", activeNodes)
+
+    if Low_bound(Nfixed,1) = activeNodes then
+        writeln("ON UPDATE LA LOWER BOUND")
+        lower_bound := Low_bound(Nfixed,2)
+    end-if
+end-procedure
+!**************************************************************************
+
+!**************************************************************************
+procedure write_msg(msglevel:integer, msg:string)
+  if msglevel<= MESSLEV then
+    writeln(msg)
+  end-if
+end-procedure
+!**************************************************************************
+
+!**************************************************************************
+procedure report_file
+
+     writeln("Printing the summary")
+    fopen(SOURCE_PATH+"LR/"+"summary_LR_BR"+BRANCH_STRATEGY+"_MIP_"+DO_MIP+".txt",F_OUTPUT)
+    writeln("Parameters: ")
+    writeln("Grid Size: ", GRID ,", Commodities: ", NbF ,", MAXPATH: ", MAXPATH)
+
+    writeln("Branching strategy: ", BRANCH_STRATEGY)
+    writeln("Linear Relaxation of Pricing: true")
+    writeln("DO_MIP: ", DO_MIP)
+    writeln("*************************")
+    writeln("Node \t Time \t Value \t BestInt \t LowerBound \t Gap(%) \t Fixed variable [f,k]")
+    forall(n in 0..getsize(nodes)-2) do
+        writeln(n, "\t", strfmt(nodes(n).time,7,2)  ,  "\t", strfmt(nodes(n).value,11,2), "\t ", strfmt(nodes(n).bestUbound,11,2), "\t ",  strfmt(nodes(n).bestLbound,11,2) , "\t ",strfmt(nodes(n).gap,8,2)+"%", "\t [", nodes(n).branchvar.f,",",nodes(n).branchvar.k,"]")
+        forall(i in 1..getsize(nodes(n).gen_path)) do
+            writeln("\t \t Path ", nodes(n).gen_path(i), ": ", ArcsInPath(nodes(n).gen_path(i)))
+        end-do
+    end-do
+
+    writeln("")
+    writeln("Total time: ",(gettime-StartTime)," sec")
+    writeln("Total time on pricing: ", tot_time_pricing , " sec")
+    writeln("Total time on MIP: ", tot_time_MIP , " sec")
+     writeln("Total MIP done:", MIP_counter)
+    writeln("Total heurisitc: ", counter_HEUR_S, "/", counter_HEUR)
+    writeln("Optimal objective value: ", Best_Value)
+
+    writeln("Optimal solution:")
+    writeln(opt_Sol_FlowPath)
+    writeln("Path selected for each commodity: ")
+    writeln(opt_Sol_PathSelect)
+    writeln("Path in term of arcs: ")
+    forall(i in Flights) do
+        writeln(ArcsInPath(opt_Sol_PathSelect(i)))
+   end-do
+
+ fclose(F_OUTPUT)
+
+    ! Printing the B&B tree
+    declarations
+      lemax: integer
+      nbofnum: integer
+    end-declarations
+
+
+    lemax := 0
+
+    forall(n in 1..getsize(nodes)-2) do
+        if nodes(n).num_fixed > lemax then
+            lemax := nodes(n).num_fixed
+        end-if
+    end-do
+
+    lemax := integer(lemax)
+
+    if lemax > 10 then
+        lemax := 10
+    end-if
+
+    nbofnum := integer(2^lemax)
+
+
+   declarations
+        bbtree: array( 1..(nbofnum+1),1..lemax) of string
+        pos: array(1..getsize(nodes)-1) of integer
+    end-declarations
+
+    forall(n in 1..getsize(nodes)-2) do
+        pos(n) += 1
+        forall(i in 1..nodes(n).num_fixed | i < 10) do
+            pos(n) += integer(nodes(n).fixed(nodes(n).num_fixed-i+1)*nbofnum/2^(i))
+        end-do
+        if(nodes(n).num_fixed < 10) then
+        bbtree(pos(n),nodes(n).num_fixed) := "Node"+n+" Value: "+strfmt(nodes(n).value,0,2)+" | "+strfmt(nodes(n).bestUbound,0,2)+" | "+ strfmt(nodes(n).bestLbound,0,2) +" | "+strfmt(nodes(n).gap,0,2)+"%"
+        end-if
+    end-do
+
+    fopen(SOURCE_PATH+"tree.txt",F_OUTPUT)
+
+    forall(j in 1..nbofnum) do
+        forall(i in 1..lemax) do
+
+        write(bbtree(j,i), ";")
+      end-do
+      writeln("")
+    end-do
+        write(bbtree)
+    fclose(F_OUTPUT)
+
+
+
+end-procedure
+!**************************************************************************
+
+end-model
